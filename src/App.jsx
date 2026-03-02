@@ -58,6 +58,15 @@ function formatElapsed(seconds) {
   return `${m}m ${s.toString().padStart(2, "0")}s`;
 }
 
+// --- Global FFmpeg log buffer for debug panel ---
+let ffmpegLogBuffer = [];
+let ffmpegLogListeners = [];
+function pushFfmpegLog(line) {
+  ffmpegLogBuffer.push(line);
+  if (ffmpegLogBuffer.length > 5) ffmpegLogBuffer.shift();
+  ffmpegLogListeners.forEach((fn) => fn([...ffmpegLogBuffer]));
+}
+
 async function convertImage(file, outputFormat, onProgress) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Image conversion timed out after 60s.")), 60000);
@@ -115,11 +124,10 @@ async function loadFFmpeg(onProgress) {
     const { fetchFile, toBlobURL } = await import("@ffmpeg/util");
     const ffmpeg = new FFmpeg();
     onProgress(15);
-    const baseURL = "https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/esm";
+    const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
     await ffmpeg.load({
       coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
       wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
-      workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, "text/javascript"),
     });
     onProgress(30);
     ffmpegInstance = { ffmpeg, fetchFile };
@@ -129,7 +137,7 @@ async function loadFFmpeg(onProgress) {
   } catch (err) {
     ffmpegLoading = false;
     notifyFFmpegListeners("error");
-    throw new Error("FFmpeg failed to load. Cross-Origin headers may be missing.");
+    throw new Error("FFmpeg failed to load: " + err.message);
   }
 }
 
@@ -157,13 +165,15 @@ async function convertMedia(file, outputFormat, onProgress) {
   args.push(outputName);
 
   // Log FFmpeg output for debugging
-  const logHandler = ({ message }) => { console.log("[ffmpeg]", message); };
+  const logHandler = ({ message }) => {
+    console.log("[ffmpeg]", message);
+    pushFfmpegLog(message);
+  };
   ffmpeg.on("log", logHandler);
 
   // Hook into real FFmpeg progress events
   const progressHandler = ({ progress: p }) => {
     if (typeof p === "number" && p >= 0) {
-      // Map FFmpeg's 0-1 progress into our 40-95 range
       const mapped = 40 + Math.min(p, 1) * 55;
       onProgress(Math.round(mapped));
     }
@@ -197,14 +207,20 @@ function Spinner({ size = 14 }) {
 
 function FFmpegBanner({ status }) {
   if (status === "loading") return (
-    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "12px 20px", background: c.surface, border: `1px solid ${c.border}`, borderRadius: 8, marginBottom: 20 }}>
-      <Spinner size={13} />
-      <span style={{ fontSize: 13, color: c.muted, fontFamily: font }}>Loading video engine (~30 MB, first time only)...</span>
+    <div style={{ padding: "20px 24px", background: c.surface, border: `1px solid ${c.border}`, borderRadius: 8, marginBottom: 24, animation: "pulse 2s ease-in-out infinite" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <Spinner size={16} />
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: c.text, fontFamily: font, marginBottom: 4 }}>Preparing video engine</div>
+          <div style={{ fontSize: 13, color: c.muted, fontFamily: font }}>Downloading ~30 MB, one-time only...</div>
+        </div>
+      </div>
     </div>
   );
   if (status === "error") return (
-    <div style={{ padding: "12px 20px", background: c.surface, border: `1px solid ${c.border}`, borderRadius: 8, marginBottom: 20 }}>
-      <span style={{ fontSize: 13, color: c.red, fontFamily: font }}>Failed to load video engine. Cross-Origin headers may be missing.</span>
+    <div style={{ padding: "16px 24px", background: c.surface, border: `1px solid ${c.border}`, borderRadius: 8, marginBottom: 24 }}>
+      <div style={{ fontSize: 14, fontWeight: 600, color: c.red, fontFamily: font, marginBottom: 4 }}>Video engine failed to load</div>
+      <div style={{ fontSize: 13, color: c.muted, fontFamily: font }}>SharedArrayBuffer may be unavailable. Check the debug panel below.</div>
     </div>
   );
   return null;
@@ -225,6 +241,36 @@ function useElapsedTimer(active) {
   return elapsed;
 }
 
+function DebugPanel({ ffmpegStatus }) {
+  const [logs, setLogs] = useState([]);
+  const sabAvailable = typeof SharedArrayBuffer !== "undefined";
+  const coiActive = typeof window !== "undefined" && window.crossOriginIsolated === true;
+
+  useEffect(() => {
+    const listener = (newLogs) => setLogs(newLogs);
+    ffmpegLogListeners.push(listener);
+    return () => { ffmpegLogListeners = ffmpegLogListeners.filter((fn) => fn !== listener); };
+  }, []);
+
+  const dot = (ok) => ({ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: ok ? c.green : c.red, marginRight: 8 });
+
+  return (
+    <div style={{ marginTop: 48, padding: 16, background: c.surface, border: `1px solid ${c.border}`, borderRadius: 8 }}>
+      <div style={{ fontSize: 11, fontWeight: 600, color: c.muted, fontFamily: font, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 12 }}>Debug</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 13, fontFamily: font }}>
+        <div style={{ color: c.text }}><span style={dot(sabAvailable)} />SharedArrayBuffer: {sabAvailable ? "available" : "unavailable"}</div>
+        <div style={{ color: c.text }}><span style={dot(coiActive)} />crossOriginIsolated: {String(coiActive)}</div>
+        <div style={{ color: c.text }}><span style={dot(ffmpegStatus === "ready")} />FFmpeg: {ffmpegStatus || "not started"}</div>
+      </div>
+      {logs.length > 0 && (
+        <div style={{ marginTop: 12, padding: 10, background: c.bg, borderRadius: 6, maxHeight: 120, overflowY: "auto", fontSize: 11, fontFamily: "monospace", color: c.muted, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+          {logs.map((line, i) => <div key={i}>{line}</div>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FileItem({ item, onRemove, onFormatChange }) {
   const cat = SUPPORTED_CONVERSIONS[item.category];
   const isConverting = item.status === "converting";
@@ -232,51 +278,87 @@ function FileItem({ item, onRemove, onFormatChange }) {
   const elapsed = useElapsedTimer(isConverting);
 
   return (
-    <div style={{ borderBottom: `1px solid ${c.border}`, padding: "16px 0", display: "flex", alignItems: "center", gap: 16 }}>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 2 }}>
-          <span style={{ fontSize: 14, fontWeight: 500, color: c.text, fontFamily: font, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.file.name}</span>
-          <span style={{ fontSize: 12, color: c.muted, fontFamily: font, flexShrink: 0 }}>{formatBytes(item.file.size)}</span>
+    <div style={{ borderBottom: `1px solid ${c.border}`, padding: "16px 0" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 2 }}>
+            <span style={{ fontSize: 14, fontWeight: 500, color: c.text, fontFamily: font, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.file.name}</span>
+            <span style={{ fontSize: 12, color: c.muted, fontFamily: font, flexShrink: 0 }}>{formatBytes(item.file.size)}</span>
+          </div>
         </div>
-        {isConverting && (
-          <>
-            <div style={{ height: 2, background: c.track, borderRadius: 1, overflow: "hidden", marginTop: 8 }}>
-              <div style={{ height: "100%", width: `${item.progress}%`, background: c.text, borderRadius: 1, transition: "width 0.4s ease" }} />
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
-              <Spinner size={11} />
-              <span style={{ fontSize: 12, color: c.muted, fontFamily: font }}>
-                {isMedia && item.progress < 40 ? "Loading engine..." : "Converting..."}{isMedia ? " This may take several minutes for large files." : ""}
-              </span>
-              <span style={{ fontSize: 12, color: c.muted, fontFamily: font, marginLeft: "auto" }}>{formatElapsed(elapsed)}</span>
-            </div>
-          </>
+        {item.status === "idle" && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style={{ color: c.muted }}><path d="M5 3l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            <select value={item.outputFormat} onChange={(e) => onFormatChange(item.id, e.target.value)}
+              style={{ background: c.surface, border: `1px solid ${c.border}`, borderRadius: 6, color: c.text, padding: "6px 10px", fontSize: 13, fontFamily: font, cursor: "pointer", outline: "none", textTransform: "uppercase", appearance: "none", WebkitAppearance: "none", paddingRight: 24, backgroundImage: `url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23737373' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")`, backgroundRepeat: "no-repeat", backgroundPosition: "right 8px center" }}>
+              {cat?.outputFormats.filter(f => f !== getFileExt(item.file.name)).map((f) => (<option key={f} value={f}>{f}</option>))}
+            </select>
+          </div>
         )}
-        {item.status === "error" && <div style={{ fontSize: 12, color: c.red, marginTop: 4, fontFamily: font }}>{item.error}</div>}
-        {item.status === "done" && item.outputBlob && (
-          <div style={{ fontSize: 12, color: c.green, marginTop: 4, fontFamily: font }}>Done · {formatBytes(item.outputBlob.size)}</div>
+        {!isConverting && item.status !== "done" && (
+          <button onClick={() => onRemove(item.id)} style={{ background: "none", border: "none", color: c.muted, cursor: "pointer", padding: "4px", lineHeight: 1, flexShrink: 0 }} aria-label="Remove">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+          </button>
         )}
       </div>
-      {item.status === "idle" && (
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style={{ color: c.muted }}><path d="M5 3l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
-          <select value={item.outputFormat} onChange={(e) => onFormatChange(item.id, e.target.value)}
-            style={{ background: c.surface, border: `1px solid ${c.border}`, borderRadius: 6, color: c.text, padding: "6px 10px", fontSize: 13, fontFamily: font, cursor: "pointer", outline: "none", textTransform: "uppercase", appearance: "none", WebkitAppearance: "none", paddingRight: 24, backgroundImage: `url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23737373' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")`, backgroundRepeat: "no-repeat", backgroundPosition: "right 8px center" }}>
-            {cat?.outputFormats.filter(f => f !== getFileExt(item.file.name)).map((f) => (<option key={f} value={f}>{f}</option>))}
-          </select>
+
+      {isConverting && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ height: 2, background: c.track, borderRadius: 1, overflow: "hidden" }}>
+            <div style={{ height: "100%", width: `${item.progress}%`, background: c.text, borderRadius: 1, transition: "width 0.4s ease" }} />
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
+            <Spinner size={11} />
+            <span style={{ fontSize: 12, color: c.muted, fontFamily: font }}>
+              Processing... {formatElapsed(elapsed)}
+            </span>
+          </div>
+          {isMedia && (
+            <div style={{ fontSize: 12, color: "rgb(70,70,70)", fontFamily: font, marginTop: 4 }}>
+              Video conversion takes 2-5 minutes depending on file size
+            </div>
+          )}
         </div>
       )}
+
+      {item.status === "error" && (
+        <div style={{ fontSize: 12, color: c.red, marginTop: 8, fontFamily: font }}>{item.error}</div>
+      )}
+
       {item.status === "done" && item.outputBlob && (
-        <button onClick={() => { const url = URL.createObjectURL(item.outputBlob); const a = document.createElement("a"); a.href = url; a.download = item.file.name.replace(/\.[^.]+$/, `.${item.outputFormat}`); a.click(); URL.revokeObjectURL(url); }}
-          style={{ background: c.text, border: "none", borderRadius: 6, color: c.bg, padding: "7px 16px", fontSize: 13, fontWeight: 600, fontFamily: font, cursor: "pointer", flexShrink: 0 }}>
-          Save
-        </button>
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: 12, color: c.green, fontFamily: font, marginBottom: 10 }}>Done · {formatBytes(item.outputBlob.size)}</div>
+          <button onClick={() => { const url = URL.createObjectURL(item.outputBlob); const a = document.createElement("a"); a.href = url; a.download = item.file.name.replace(/\.[^.]+$/, `.${item.outputFormat}`); a.click(); URL.revokeObjectURL(url); }}
+            style={{ width: "100%", background: c.text, border: "none", borderRadius: 8, color: c.bg, padding: "12px 24px", fontSize: 14, fontWeight: 600, fontFamily: font, cursor: "pointer" }}>
+            Download {item.file.name.replace(/\.[^.]+$/, `.${item.outputFormat}`)}
+          </button>
+        </div>
       )}
-      {!isConverting && (
-        <button onClick={() => onRemove(item.id)} style={{ background: "none", border: "none", color: c.muted, fontSize: 18, cursor: "pointer", padding: "4px", lineHeight: 1, flexShrink: 0 }} aria-label="Remove">
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
-        </button>
-      )}
+    </div>
+  );
+}
+
+function HowItWorks() {
+  const stepStyle = { flex: 1, textAlign: "center", padding: "20px 16px", background: c.surface, borderRadius: 8, border: `1px solid ${c.border}` };
+  const numStyle = { fontSize: 11, fontWeight: 600, color: c.muted, fontFamily: font, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8 };
+  const labelStyle = { fontSize: 14, fontWeight: 500, color: c.text, fontFamily: font };
+
+  return (
+    <div className="how-it-works" style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 32 }}>
+      <div style={stepStyle}>
+        <div style={numStyle}>Step 1</div>
+        <div style={labelStyle}>Drop or select files</div>
+      </div>
+      <svg className="step-arrow" width="20" height="20" viewBox="0 0 20 20" fill="none" style={{ flexShrink: 0, color: c.muted }}><path d="M7 4l6 6-6 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+      <div style={stepStyle}>
+        <div style={numStyle}>Step 2</div>
+        <div style={labelStyle}>Pick output format</div>
+      </div>
+      <svg className="step-arrow" width="20" height="20" viewBox="0 0 20 20" fill="none" style={{ flexShrink: 0, color: c.muted }}><path d="M7 4l6 6-6 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+      <div style={stepStyle}>
+        <div style={numStyle}>Step 3</div>
+        <div style={labelStyle}>Convert</div>
+      </div>
     </div>
   );
 }
@@ -362,10 +444,13 @@ export default function FileConverter() {
       <div style={{ maxWidth: 640, margin: "0 auto", padding: "64px 24px 48px" }}>
 
         {/* Header */}
-        <div style={{ marginBottom: 56 }}>
+        <div style={{ marginBottom: 40 }}>
           <h1 style={{ fontSize: "clamp(28px, 5vw, 36px)", fontWeight: 700, letterSpacing: "-0.03em", color: c.text, marginBottom: 8 }}>Convertron</h1>
           <p style={{ fontSize: 15, color: c.muted, fontFamily: font, lineHeight: 1.5 }}>Convert images, video, and audio in your browser. Nothing is uploaded. Free, private, no limits.</p>
         </div>
+
+        {/* How it works */}
+        {files.length === 0 && <HowItWorks />}
 
         <FFmpegBanner status={ffmpegStatus} />
 
@@ -420,8 +505,11 @@ export default function FileConverter() {
           </div>
         )}
 
+        {/* Debug panel */}
+        <DebugPanel ffmpegStatus={ffmpegStatus} />
+
         {/* Footer */}
-        <div style={{ marginTop: 56, fontSize: 12, color: "rgb(50,50,50)", fontFamily: font }}>
+        <div style={{ marginTop: 32, fontSize: 12, color: "rgb(50,50,50)", fontFamily: font }}>
           100% client-side. Your files never leave your device.
         </div>
       </div>

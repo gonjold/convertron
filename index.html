@@ -13,18 +13,21 @@
     <meta name="twitter:title" content="Convertron — Free File Converter" />
     <meta name="twitter:description" content="Convert images, videos, and audio free in your browser. No uploads, no servers, no limits." />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin="anonymous" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" crossorigin="anonymous" />
     <style>
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
       body { background: rgb(10, 10, 10); }
       ::selection { background: #fff; color: #000; }
       select option { background: rgb(20, 20, 20); color: #fff; }
       @keyframes spin { to { transform: rotate(360deg); } }
+      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
       @media (max-width: 600px) {
         .action-buttons { flex-direction: column !important; }
         .action-buttons button { width: 100% !important; }
+        .how-it-works { flex-direction: column !important; gap: 16px !important; }
+        .how-it-works .step-arrow { display: none !important; }
       }
     </style>
   </head>
