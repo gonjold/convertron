@@ -92,19 +92,21 @@ exports.convertMedia = onCall(
         let cmd = ffmpeg(inputPath);
 
         // Format-specific encoding settings
+        // Output -r 30 caps framerate (prevents VFR WebM 1000fps explosion)
+        // This is NOT the same as input -r 30 which breaks playback speed
         if (outputFormat === "mp4") {
           cmd = cmd
             .videoCodec("libx264")
             .audioCodec("aac")
-            .outputOptions(["-vsync", "cfr", "-preset", "ultrafast", "-crf", "23", "-movflags", "+faststart"]);
+            .outputOptions(["-r", "30", "-preset", "fast", "-crf", "26", "-movflags", "+faststart"]);
         } else if (outputFormat === "webm") {
           cmd = cmd
             .videoCodec("libvpx-vp9")
             .audioCodec("libopus")
-            .outputOptions(["-vsync", "cfr", "-crf", "30", "-b:v", "0", "-cpu-used", "4", "-deadline", "realtime"]);
+            .outputOptions(["-r", "30", "-crf", "33", "-b:v", "0", "-cpu-used", "4", "-deadline", "realtime"]);
         } else if (outputFormat === "gif") {
           cmd = cmd
-            .outputOptions(["-vsync", "cfr", "-vf", "fps=15,scale=480:-1:flags=lanczos", "-loop", "0"])
+            .outputOptions(["-vf", "fps=15,scale=480:-1:flags=lanczos", "-loop", "0"])
             .noAudio();
         } else if (outputFormat === "mp3") {
           cmd = cmd.noVideo().audioCodec("libmp3lame").audioBitrate("192k");
@@ -117,11 +119,11 @@ exports.convertMedia = onCall(
         } else if (outputFormat === "aac") {
           cmd = cmd.noVideo().audioCodec("aac").audioBitrate("192k");
         } else if (outputFormat === "avi") {
-          cmd = cmd.videoCodec("libx264").audioCodec("aac").outputOptions(["-vsync", "cfr", "-preset", "ultrafast"]);
+          cmd = cmd.videoCodec("libx264").audioCodec("aac").outputOptions(["-r", "30", "-preset", "fast", "-crf", "26"]);
         } else if (outputFormat === "mov") {
-          cmd = cmd.videoCodec("libx264").audioCodec("aac").outputOptions(["-vsync", "cfr", "-preset", "ultrafast", "-movflags", "+faststart"]);
+          cmd = cmd.videoCodec("libx264").audioCodec("aac").outputOptions(["-r", "30", "-preset", "fast", "-crf", "26", "-movflags", "+faststart"]);
         } else if (outputFormat === "mkv") {
-          cmd = cmd.videoCodec("libx264").audioCodec("aac").outputOptions(["-vsync", "cfr", "-preset", "ultrafast"]);
+          cmd = cmd.videoCodec("libx264").audioCodec("aac").outputOptions(["-r", "30", "-preset", "fast", "-crf", "26"]);
         }
 
         cmd
