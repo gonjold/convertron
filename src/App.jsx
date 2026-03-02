@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 
 const SUPPORTED_CONVERSIONS = {
   image: {
@@ -76,11 +76,21 @@ async function convertImage(file, outputFormat, onProgress) {
 
 let ffmpegInstance = null;
 let ffmpegLoading = false;
+let ffmpegLoadListeners = [];
+
+function notifyFFmpegListeners(status) {
+  ffmpegLoadListeners.forEach((fn) => fn(status));
+}
 
 async function loadFFmpeg(onProgress) {
   if (ffmpegInstance) return ffmpegInstance;
-  if (ffmpegLoading) { while (ffmpegLoading) await new Promise((r) => setTimeout(r, 200)); return ffmpegInstance; }
+  if (ffmpegLoading) {
+    while (ffmpegLoading) await new Promise((r) => setTimeout(r, 200));
+    if (!ffmpegInstance) throw new Error("FFmpeg failed to load.");
+    return ffmpegInstance;
+  }
   ffmpegLoading = true;
+  notifyFFmpegListeners("loading");
   onProgress(5);
   try {
     const { FFmpeg } = await import("@ffmpeg/ffmpeg");
@@ -95,8 +105,20 @@ async function loadFFmpeg(onProgress) {
     onProgress(30);
     ffmpegInstance = { ffmpeg, fetchFile };
     ffmpegLoading = false;
+    notifyFFmpegListeners("ready");
     return ffmpegInstance;
-  } catch (err) { ffmpegLoading = false; throw new Error("FFmpeg failed to load. Make sure the site is served with Cross-Origin headers enabled."); }
+  } catch (err) {
+    ffmpegLoading = false;
+    notifyFFmpegListeners("error");
+    throw new Error("FFmpeg failed to load. Make sure the site is served with Cross-Origin headers enabled.");
+  }
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`Conversion timed out after ${Math.round(ms / 1000)}s. Try a smaller file or different format.`)), ms)),
+  ]);
 }
 
 async function convertMedia(file, outputFormat, onProgress) {
@@ -118,7 +140,7 @@ async function convertMedia(file, outputFormat, onProgress) {
   else if (outputFormat === "aac") args.push("-vn", "-c:a", "aac", "-b:a", "192k");
   args.push(outputName);
   onProgress(60);
-  await ffmpeg.exec(args);
+  await withTimeout(ffmpeg.exec(args), 60000);
   onProgress(90);
   const data = await ffmpeg.readFile(outputName);
   onProgress(100);
@@ -126,20 +148,44 @@ async function convertMedia(file, outputFormat, onProgress) {
   return new Blob([data.buffer], { type: mimeMap[outputFormat] || "application/octet-stream" });
 }
 
+function Spinner({ size = 16, color = "#6366f1" }) {
+  return (
+    <div style={{ width: size, height: size, border: `2px solid ${color}33`, borderTopColor: color, borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
+  );
+}
+
+function FFmpegBanner({ status }) {
+  if (status === "loading") return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "12px 20px", background: "rgba(99,102,241,0.08)", border: "1px solid rgba(99,102,241,0.2)", borderRadius: 10, marginBottom: 16 }}>
+      <Spinner size={14} color="#6366f1" />
+      <span style={{ fontSize: 13, color: "#a5b4fc", fontFamily: "'JetBrains Mono', monospace" }}>Loading video engine (~30 MB, first time only)...</span>
+    </div>
+  );
+  if (status === "error") return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "12px 20px", background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 10, marginBottom: 16 }}>
+      <span style={{ fontSize: 13, color: "#fca5a5", fontFamily: "'JetBrains Mono', monospace" }}>Failed to load video engine. Cross-Origin headers may be missing.</span>
+    </div>
+  );
+  return null;
+}
+
 function FileItem({ item, onRemove, onFormatChange }) {
   const cat = SUPPORTED_CONVERSIONS[item.category];
   const barColor = cat?.color || "#888";
   return (
-    <div style={{ background: item.status === "done" ? "rgba(16,185,129,0.06)" : item.status === "error" ? "rgba(239,68,68,0.06)" : "rgba(255,255,255,0.03)", border: `1px solid ${item.status === "done" ? "rgba(16,185,129,0.2)" : item.status === "error" ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.08)"}`, borderRadius: 10, padding: "14px 18px", display: "flex", alignItems: "center", gap: 14, transition: "all 0.3s ease" }}>
+    <div style={{ background: item.status === "done" ? "rgba(16,185,129,0.06)" : item.status === "error" ? "rgba(239,68,68,0.06)" : "rgba(255,255,255,0.03)", border: `1px solid ${item.status === "done" ? "rgba(16,185,129,0.2)" : item.status === "error" ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.08)"}`, borderRadius: 10, padding: "14px 18px", display: "flex", alignItems: "center", gap: 14, transition: "all 0.3s ease", flexWrap: "wrap" }}>
       <div style={{ fontSize: 26, lineHeight: 1 }}>{cat?.icon || "📄"}</div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-          <span style={{ fontFamily: "'JetBrains Mono', 'SF Mono', monospace", fontSize: 13, fontWeight: 600, color: "#e2e8f0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.file.name}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
+          <span style={{ fontFamily: "'JetBrains Mono', 'SF Mono', monospace", fontSize: 13, fontWeight: 600, color: "#e2e8f0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "100%" }}>{item.file.name}</span>
           <span style={{ fontSize: 11, color: "#64748b", fontFamily: "'JetBrains Mono', monospace", flexShrink: 0 }}>{formatBytes(item.file.size)}</span>
         </div>
         {item.status === "converting" && (
-          <div style={{ height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2, overflow: "hidden", marginTop: 6 }}>
-            <div style={{ height: "100%", width: `${item.progress}%`, background: `linear-gradient(90deg, ${barColor}, ${barColor}cc)`, borderRadius: 2, transition: "width 0.3s ease" }} />
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+            <div style={{ flex: 1, height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2, overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${item.progress}%`, background: `linear-gradient(90deg, ${barColor}, ${barColor}cc)`, borderRadius: 2, transition: "width 0.3s ease" }} />
+            </div>
+            <Spinner size={12} color={barColor} />
           </div>
         )}
         {item.status === "error" && <div style={{ fontSize: 11, color: "#ef4444", marginTop: 4, fontFamily: "'JetBrains Mono', monospace" }}>{item.error}</div>}
@@ -170,8 +216,15 @@ function FileItem({ item, onRemove, onFormatChange }) {
 export default function FileConverter() {
   const [files, setFiles] = useState([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [ffmpegStatus, setFfmpegStatus] = useState(null);
   const fileInputRef = useRef(null);
   const idCounter = useRef(0);
+
+  useEffect(() => {
+    const listener = (status) => setFfmpegStatus(status);
+    ffmpegLoadListeners.push(listener);
+    return () => { ffmpegLoadListeners = ffmpegLoadListeners.filter((fn) => fn !== listener); };
+  }, []);
 
   const addFiles = useCallback((newFiles) => {
     const items = Array.from(newFiles).map((file) => {
@@ -188,6 +241,27 @@ export default function FileConverter() {
     });
     setFiles((prev) => [...prev, ...items]);
   }, []);
+
+  // Clipboard paste support
+  useEffect(() => {
+    const handlePaste = (e) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const pastedFiles = [];
+      for (const item of items) {
+        if (item.kind === "file") {
+          const file = item.getAsFile();
+          if (file) pastedFiles.push(file);
+        }
+      }
+      if (pastedFiles.length > 0) {
+        e.preventDefault();
+        addFiles(pastedFiles);
+      }
+    };
+    document.addEventListener("paste", handlePaste);
+    return () => document.removeEventListener("paste", handlePaste);
+  }, [addFiles]);
 
   const handleDrop = useCallback((e) => { e.preventDefault(); setIsDragging(false); if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files); }, [addFiles]);
   const handleDragOver = useCallback((e) => { e.preventDefault(); setIsDragging(true); }, []);
@@ -223,9 +297,9 @@ export default function FileConverter() {
         <div style={{ textAlign: "center", marginBottom: 48 }}>
           <div style={{ display: "inline-flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
             <div style={{ width: 40, height: 40, borderRadius: 10, background: "linear-gradient(135deg, #6366f1, #10b981)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>⚡</div>
-            <h1 style={{ fontSize: 32, fontWeight: 800, letterSpacing: "-0.03em", margin: 0, background: "linear-gradient(135deg, #e2e8f0, #94a3b8)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>CONVERTRON</h1>
+            <h1 style={{ fontSize: "clamp(24px, 5vw, 32px)", fontWeight: 800, letterSpacing: "-0.03em", margin: 0, background: "linear-gradient(135deg, #e2e8f0, #94a3b8)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>CONVERTRON</h1>
           </div>
-          <p style={{ color: "#64748b", fontSize: 14, margin: 0, fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.02em" }}>Free, private, runs in your browser · No uploads, no servers, no limits</p>
+          <p style={{ color: "#64748b", fontSize: "clamp(11px, 2.5vw, 14px)", margin: 0, fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.02em" }}>Free, private, runs in your browser · No uploads, no servers, no limits</p>
           <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: 6, marginTop: 20 }}>
             {Object.entries(SUPPORTED_CONVERSIONS).map(([key, cat]) => (
               <div key={key} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 10px", borderRadius: 20, background: `${cat.color}11`, border: `1px solid ${cat.color}33`, fontSize: 11, color: cat.color, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>
@@ -234,12 +308,16 @@ export default function FileConverter() {
             ))}
           </div>
         </div>
+
+        <FFmpegBanner status={ffmpegStatus} />
+
         <div onDrop={handleDrop} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onClick={() => fileInputRef.current?.click()}
-          style={{ border: `2px dashed ${isDragging ? "#6366f1" : "rgba(255,255,255,0.1)"}`, borderRadius: 16, padding: files.length === 0 ? "60px 40px" : "30px 40px", textAlign: "center", cursor: "pointer", transition: "all 0.3s ease", background: isDragging ? "rgba(99,102,241,0.05)" : "rgba(255,255,255,0.01)", marginBottom: 24 }}>
+          style={{ border: `2px dashed ${isDragging ? "#6366f1" : "rgba(255,255,255,0.1)"}`, borderRadius: 16, padding: files.length === 0 ? "60px 20px" : "30px 20px", textAlign: "center", cursor: "pointer", transition: "all 0.3s ease", background: isDragging ? "rgba(99,102,241,0.05)" : "rgba(255,255,255,0.01)", marginBottom: 24 }}>
           <input ref={fileInputRef} type="file" multiple accept={uniqueFormats.map((f) => `.${f}`).join(",")} onChange={(e) => { if (e.target.files.length) addFiles(e.target.files); e.target.value = ""; }} style={{ display: "none" }} />
           <div style={{ fontSize: 36, marginBottom: 12, opacity: 0.6 }}>{isDragging ? "⚡" : "↑"}</div>
           <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6, color: "#cbd5e1" }}>{isDragging ? "Drop files to convert" : "Drop files here or click to browse"}</div>
           <div style={{ fontSize: 12, color: "#475569", fontFamily: "'JetBrains Mono', monospace" }}>Images · Videos · Audio — all converted locally in your browser</div>
+          <div style={{ fontSize: 11, color: "#334155", fontFamily: "'JetBrains Mono', monospace", marginTop: 8 }}>You can also paste images with Ctrl+V / Cmd+V</div>
         </div>
         {files.length > 0 && (
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 24 }}>
@@ -247,7 +325,7 @@ export default function FileConverter() {
           </div>
         )}
         {files.length > 0 && (
-          <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+          <div className="action-buttons" style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
             {idleFiles.length > 0 && (
               <button onClick={convertAll} style={{ background: "linear-gradient(135deg, #6366f1, #4f46e5)", border: "none", borderRadius: 10, color: "#fff", padding: "12px 28px", fontSize: 14, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.08em", boxShadow: "0 4px 20px rgba(99,102,241,0.3)" }}>
                 ⚡ Convert {idleFiles.length > 1 ? `All (${idleFiles.length})` : ""}
