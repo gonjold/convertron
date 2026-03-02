@@ -1,4 +1,8 @@
 import { useState, useRef, useCallback, useEffect } from "react";
+import { ref, uploadBytesResumable } from "firebase/storage";
+import { doc, setDoc, onSnapshot } from "firebase/firestore";
+import { httpsCallable } from "firebase/functions";
+import { storage, db, functions } from "./firebase";
 
 const SUPPORTED_CONVERSIONS = {
   image: {
@@ -58,15 +62,7 @@ function formatElapsed(seconds) {
   return `${m}m ${s.toString().padStart(2, "0")}s`;
 }
 
-// --- Global FFmpeg log buffer for debug panel ---
-let ffmpegLogBuffer = [];
-let ffmpegLogListeners = [];
-function pushFfmpegLog(line) {
-  ffmpegLogBuffer.push(line);
-  if (ffmpegLogBuffer.length > 5) ffmpegLogBuffer.shift();
-  ffmpegLogListeners.forEach((fn) => fn([...ffmpegLogBuffer]));
-}
-
+// --- Image conversion (client-side, unchanged) ---
 async function convertImage(file, outputFormat, onProgress) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Image conversion timed out after 60s.")), 60000);
@@ -101,129 +97,91 @@ async function convertImage(file, outputFormat, onProgress) {
   });
 }
 
-let ffmpegInstance = null;
-let ffmpegLoading = false;
-let ffmpegLoadListeners = [];
-
-function notifyFFmpegListeners(status) {
-  ffmpegLoadListeners.forEach((fn) => fn(status));
+// --- Server-side media conversion via Firebase ---
+function generateDocId() {
+  return crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-async function loadFFmpeg(onProgress) {
-  if (ffmpegInstance) return ffmpegInstance;
-  if (ffmpegLoading) {
-    while (ffmpegLoading) await new Promise((r) => setTimeout(r, 200));
-    if (!ffmpegInstance) throw new Error("FFmpeg failed to load.");
-    return ffmpegInstance;
-  }
-  ffmpegLoading = true;
-  notifyFFmpegListeners("loading");
-  onProgress(5);
-  try {
-    const { FFmpeg } = await import("@ffmpeg/ffmpeg");
-    const { fetchFile, toBlobURL } = await import("@ffmpeg/util");
-    const ffmpeg = new FFmpeg();
-    onProgress(15);
-    const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
-    await ffmpeg.load({
-      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+async function convertMediaServer(file, outputFormat, onProgress, onStatus) {
+  const docId = generateDocId();
+  const storagePath = `temp/conversions/${docId}/input.${getFileExt(file.name)}`;
+  const storageRef = ref(storage, storagePath);
+
+  // Phase 1: Upload to Firebase Storage (0-50%)
+  onStatus("uploading");
+  await new Promise((resolve, reject) => {
+    const uploadTask = uploadBytesResumable(storageRef, file);
+    uploadTask.on(
+      "state_changed",
+      (snapshot) => {
+        const pct = (snapshot.bytesTransferred / snapshot.totalBytes) * 50;
+        onProgress(Math.round(pct));
+      },
+      (error) => reject(new Error("Upload failed: " + error.message)),
+      () => resolve()
+    );
+  });
+
+  onProgress(50);
+
+  // Create Firestore doc to track conversion
+  const docRef = doc(db, "conversions", docId);
+  await setDoc(docRef, {
+    status: "pending",
+    storagePath,
+    outputFormat,
+    createdAt: Date.now(),
+  });
+
+  // Phase 2: Call Cloud Function
+  onStatus("processing");
+  const convertMedia = httpsCallable(functions, "convertMedia", { timeout: 300000 });
+
+  // Start Firestore listener for status updates
+  const statusPromise = new Promise((resolve, reject) => {
+    const unsubscribe = onSnapshot(docRef, (snap) => {
+      const data = snap.data();
+      if (!data) return;
+
+      if (data.status === "processing") {
+        onProgress(60);
+      } else if (data.status === "complete") {
+        unsubscribe();
+        resolve(data);
+      } else if (data.status === "error") {
+        unsubscribe();
+        reject(new Error(data.error || "Conversion failed on server"));
+      }
     });
-    onProgress(30);
-    ffmpegInstance = { ffmpeg, fetchFile };
-    ffmpegLoading = false;
-    notifyFFmpegListeners("ready");
-    return ffmpegInstance;
-  } catch (err) {
-    ffmpegLoading = false;
-    notifyFFmpegListeners("error");
-    throw new Error("FFmpeg failed to load: " + err.message);
-  }
-}
 
-const MEDIA_TIMEOUT_MS = 10 * 60 * 1000;
+    // Timeout safety
+    setTimeout(() => {
+      unsubscribe();
+      reject(new Error("Conversion timed out after 5 minutes"));
+    }, 5 * 60 * 1000);
+  });
 
-async function convertMedia(file, outputFormat, onProgress) {
-  const { ffmpeg, fetchFile } = await loadFFmpeg(onProgress);
-  const inputExt = getFileExt(file.name);
-  const inputName = `input.${inputExt}`;
-  const outputName = `output.${outputFormat}`;
+  // Fire the function call (don't await — we listen via Firestore)
+  convertMedia({ storagePath, outputFormat, docId }).catch(() => {
+    // Error will surface through Firestore listener
+  });
 
-  onProgress(35);
-  await ffmpeg.writeFile(inputName, await fetchFile(file));
-  onProgress(40);
-
-  let args = ["-i", inputName];
-  if (outputFormat === "gif") args.push("-vf", "fps=15,scale=480:-1:flags=lanczos", "-loop", "0");
-  else if (outputFormat === "mp4") args.push("-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac");
-  else if (outputFormat === "webm") args.push("-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0", "-c:a", "libopus");
-  else if (outputFormat === "mp3") args.push("-vn", "-ab", "192k");
-  else if (outputFormat === "wav") args.push("-vn");
-  else if (outputFormat === "ogg") args.push("-vn", "-c:a", "libvorbis");
-  else if (outputFormat === "flac") args.push("-vn", "-c:a", "flac");
-  else if (outputFormat === "aac") args.push("-vn", "-c:a", "aac", "-b:a", "192k");
-  args.push(outputName);
-
-  // Log FFmpeg output for debugging
-  const logHandler = ({ message }) => {
-    console.log("[ffmpeg]", message);
-    pushFfmpegLog(message);
-  };
-  ffmpeg.on("log", logHandler);
-
-  // Hook into real FFmpeg progress events
-  const progressHandler = ({ progress: p }) => {
-    if (typeof p === "number" && p >= 0) {
-      const mapped = 40 + Math.min(p, 1) * 55;
-      onProgress(Math.round(mapped));
-    }
-  };
-  ffmpeg.on("progress", progressHandler);
-
-  try {
-    await Promise.race([
-      ffmpeg.exec(args),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Conversion timed out after 10 minutes. Try a smaller file.")), MEDIA_TIMEOUT_MS)
-      ),
-    ]);
-  } finally {
-    ffmpeg.off("progress", progressHandler);
-    ffmpeg.off("log", logHandler);
-  }
-
-  onProgress(96);
-  const data = await ffmpeg.readFile(outputName);
+  // Wait for completion via Firestore
+  const result = await statusPromise;
+  onProgress(95);
+  onStatus("done");
   onProgress(100);
-  const mimeMap = { mp4: "video/mp4", webm: "video/webm", avi: "video/x-msvideo", mov: "video/quicktime", mkv: "video/x-matroska", gif: "image/gif", mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", flac: "audio/flac", aac: "audio/aac" };
-  return new Blob([data.buffer], { type: mimeMap[outputFormat] || "application/octet-stream" });
+
+  return {
+    downloadUrl: result.downloadUrl,
+    outputSize: result.outputSize,
+  };
 }
 
 function Spinner({ size = 14 }) {
   return (
     <div style={{ width: size, height: size, border: `1.5px solid ${c.track}`, borderTopColor: c.muted, borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
   );
-}
-
-function FFmpegBanner({ status }) {
-  if (status === "loading") return (
-    <div style={{ padding: "20px 24px", background: c.surface, border: `1px solid ${c.border}`, borderRadius: 8, marginBottom: 24, animation: "pulse 2s ease-in-out infinite" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-        <Spinner size={16} />
-        <div>
-          <div style={{ fontSize: 14, fontWeight: 600, color: c.text, fontFamily: font, marginBottom: 4 }}>Preparing video engine</div>
-          <div style={{ fontSize: 13, color: c.muted, fontFamily: font }}>Downloading ~30 MB, one-time only...</div>
-        </div>
-      </div>
-    </div>
-  );
-  if (status === "error") return (
-    <div style={{ padding: "16px 24px", background: c.surface, border: `1px solid ${c.border}`, borderRadius: 8, marginBottom: 24 }}>
-      <div style={{ fontSize: 14, fontWeight: 600, color: c.red, fontFamily: font, marginBottom: 4 }}>Video engine failed to load</div>
-      <div style={{ fontSize: 13, color: c.muted, fontFamily: font }}>SharedArrayBuffer may be unavailable. Check the debug panel below.</div>
-    </div>
-  );
-  return null;
 }
 
 function useElapsedTimer(active) {
@@ -241,41 +199,19 @@ function useElapsedTimer(active) {
   return elapsed;
 }
 
-function DebugPanel({ ffmpegStatus }) {
-  const [logs, setLogs] = useState([]);
-  const sabAvailable = typeof SharedArrayBuffer !== "undefined";
-  const coiActive = typeof window !== "undefined" && window.crossOriginIsolated === true;
-
-  useEffect(() => {
-    const listener = (newLogs) => setLogs(newLogs);
-    ffmpegLogListeners.push(listener);
-    return () => { ffmpegLogListeners = ffmpegLogListeners.filter((fn) => fn !== listener); };
-  }, []);
-
-  const dot = (ok) => ({ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: ok ? c.green : c.red, marginRight: 8 });
-
-  return (
-    <div style={{ marginTop: 48, padding: 16, background: c.surface, border: `1px solid ${c.border}`, borderRadius: 8 }}>
-      <div style={{ fontSize: 11, fontWeight: 600, color: c.muted, fontFamily: font, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 12 }}>Debug</div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 13, fontFamily: font }}>
-        <div style={{ color: c.text }}><span style={dot(sabAvailable)} />SharedArrayBuffer: {sabAvailable ? "available" : "unavailable"}</div>
-        <div style={{ color: c.text }}><span style={dot(coiActive)} />crossOriginIsolated: {String(coiActive)}</div>
-        <div style={{ color: c.text }}><span style={dot(ffmpegStatus === "ready")} />FFmpeg: {ffmpegStatus || "not started"}</div>
-      </div>
-      {logs.length > 0 && (
-        <div style={{ marginTop: 12, padding: 10, background: c.bg, borderRadius: 6, maxHeight: 120, overflowY: "auto", fontSize: 11, fontFamily: "monospace", color: c.muted, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
-          {logs.map((line, i) => <div key={i}>{line}</div>)}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function FileItem({ item, onRemove, onFormatChange }) {
   const cat = SUPPORTED_CONVERSIONS[item.category];
   const isConverting = item.status === "converting";
   const isMedia = item.category === "video" || item.category === "audio";
   const elapsed = useElapsedTimer(isConverting);
+
+  const statusLabel = isMedia && isConverting
+    ? item.serverStatus === "uploading"
+      ? "Uploading..."
+      : item.serverStatus === "processing"
+        ? "Converting on server..."
+        : "Processing..."
+    : "Processing...";
 
   return (
     <div style={{ borderBottom: `1px solid ${c.border}`, padding: "16px 0" }}>
@@ -310,14 +246,9 @@ function FileItem({ item, onRemove, onFormatChange }) {
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
             <Spinner size={11} />
             <span style={{ fontSize: 12, color: c.muted, fontFamily: font }}>
-              Processing... {formatElapsed(elapsed)}
+              {statusLabel} {formatElapsed(elapsed)}
             </span>
           </div>
-          {isMedia && (
-            <div style={{ fontSize: 12, color: "rgb(70,70,70)", fontFamily: font, marginTop: 4 }}>
-              Video conversion takes 2-5 minutes depending on file size
-            </div>
-          )}
         </div>
       )}
 
@@ -325,7 +256,19 @@ function FileItem({ item, onRemove, onFormatChange }) {
         <div style={{ fontSize: 12, color: c.red, marginTop: 8, fontFamily: font }}>{item.error}</div>
       )}
 
-      {item.status === "done" && item.outputBlob && (
+      {item.status === "done" && item.downloadUrl && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: 12, color: c.green, fontFamily: font, marginBottom: 10 }}>
+            Done{item.outputSize ? ` · ${formatBytes(item.outputSize)}` : ""}
+          </div>
+          <a href={item.downloadUrl} download={item.file.name.replace(/\.[^.]+$/, `.${item.outputFormat}`)}
+            style={{ display: "block", width: "100%", background: c.text, border: "none", borderRadius: 8, color: c.bg, padding: "12px 24px", fontSize: 14, fontWeight: 600, fontFamily: font, cursor: "pointer", textAlign: "center", textDecoration: "none", boxSizing: "border-box" }}>
+            Download {item.file.name.replace(/\.[^.]+$/, `.${item.outputFormat}`)}
+          </a>
+        </div>
+      )}
+
+      {item.status === "done" && item.outputBlob && !item.downloadUrl && (
         <div style={{ marginTop: 10 }}>
           <div style={{ fontSize: 12, color: c.green, fontFamily: font, marginBottom: 10 }}>Done · {formatBytes(item.outputBlob.size)}</div>
           <button onClick={() => { const url = URL.createObjectURL(item.outputBlob); const a = document.createElement("a"); a.href = url; a.download = item.file.name.replace(/\.[^.]+$/, `.${item.outputFormat}`); a.click(); URL.revokeObjectURL(url); }}
@@ -366,15 +309,8 @@ function HowItWorks() {
 export default function FileConverter() {
   const [files, setFiles] = useState([]);
   const [isDragging, setIsDragging] = useState(false);
-  const [ffmpegStatus, setFfmpegStatus] = useState(null);
   const fileInputRef = useRef(null);
   const idCounter = useRef(0);
-
-  useEffect(() => {
-    const listener = (status) => setFfmpegStatus(status);
-    ffmpegLoadListeners.push(listener);
-    return () => { ffmpegLoadListeners = ffmpegLoadListeners.filter((fn) => fn !== listener); };
-  }, []);
 
   const addFiles = useCallback((newFiles) => {
     const items = Array.from(newFiles).map((file) => {
@@ -387,7 +323,7 @@ export default function FileConverter() {
       if (ext === "wav" && outputFormats.includes("mp3")) defaultOutput = "mp3";
       if (ext === "bmp" && outputFormats.includes("png")) defaultOutput = "png";
       if (ext === "flac" && outputFormats.includes("mp3")) defaultOutput = "mp3";
-      return { id: ++idCounter.current, file, category, outputFormat: defaultOutput, status: category ? "idle" : "unsupported", progress: 0, outputBlob: null, error: null };
+      return { id: ++idCounter.current, file, category, outputFormat: defaultOutput, status: category ? "idle" : "unsupported", progress: 0, outputBlob: null, outputSize: null, downloadUrl: null, serverStatus: null, error: null };
     });
     setFiles((prev) => [...prev, ...items]);
   }, []);
@@ -419,20 +355,43 @@ export default function FileConverter() {
   const changeFormat = (id, format) => setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, outputFormat: format } : f)));
 
   const convertFile = async (item) => {
-    setFiles((prev) => prev.map((f) => (f.id === item.id ? { ...f, status: "converting", progress: 0 } : f)));
+    setFiles((prev) => prev.map((f) => (f.id === item.id ? { ...f, status: "converting", progress: 0, serverStatus: null } : f)));
     const onProgress = (p) => setFiles((prev) => prev.map((f) => (f.id === item.id ? { ...f, progress: p } : f)));
+
     try {
-      let blob;
-      if (item.category === "image") blob = await convertImage(item.file, item.outputFormat, onProgress);
-      else blob = await convertMedia(item.file, item.outputFormat, onProgress);
-      setFiles((prev) => prev.map((f) => (f.id === item.id ? { ...f, status: "done", progress: 100, outputBlob: blob } : f)));
+      if (item.category === "image") {
+        // Client-side image conversion (unchanged)
+        const blob = await convertImage(item.file, item.outputFormat, onProgress);
+        setFiles((prev) => prev.map((f) => (f.id === item.id ? { ...f, status: "done", progress: 100, outputBlob: blob } : f)));
+      } else {
+        // Server-side media conversion via Firebase
+        const onStatus = (status) => setFiles((prev) => prev.map((f) => (f.id === item.id ? { ...f, serverStatus: status } : f)));
+        const result = await convertMediaServer(item.file, item.outputFormat, onProgress, onStatus);
+        setFiles((prev) => prev.map((f) => (f.id === item.id ? { ...f, status: "done", progress: 100, downloadUrl: result.downloadUrl, outputSize: result.outputSize } : f)));
+      }
     } catch (err) {
       setFiles((prev) => prev.map((f) => (f.id === item.id ? { ...f, status: "error", error: err.message } : f)));
     }
   };
 
   const convertAll = () => files.filter((f) => f.status === "idle" && f.category).forEach(convertFile);
-  const downloadAll = () => { files.filter((f) => f.status === "done" && f.outputBlob).forEach((f) => { const url = URL.createObjectURL(f.outputBlob); const a = document.createElement("a"); a.href = url; a.download = f.file.name.replace(/\.[^.]+$/, `.${f.outputFormat}`); a.click(); URL.revokeObjectURL(url); }); };
+  const downloadAll = () => {
+    files.filter((f) => f.status === "done").forEach((f) => {
+      if (f.outputBlob) {
+        const url = URL.createObjectURL(f.outputBlob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = f.file.name.replace(/\.[^.]+$/, `.${f.outputFormat}`);
+        a.click();
+        URL.revokeObjectURL(url);
+      } else if (f.downloadUrl) {
+        const a = document.createElement("a");
+        a.href = f.downloadUrl;
+        a.download = f.file.name.replace(/\.[^.]+$/, `.${f.outputFormat}`);
+        a.click();
+      }
+    });
+  };
   const clearAll = () => setFiles([]);
   const idleFiles = files.filter((f) => f.status === "idle");
   const doneFiles = files.filter((f) => f.status === "done");
@@ -446,13 +405,11 @@ export default function FileConverter() {
         {/* Header */}
         <div style={{ marginBottom: 40 }}>
           <h1 style={{ fontSize: "clamp(28px, 5vw, 36px)", fontWeight: 700, letterSpacing: "-0.03em", color: c.text, marginBottom: 8 }}>Convertron</h1>
-          <p style={{ fontSize: 15, color: c.muted, fontFamily: font, lineHeight: 1.5 }}>Convert images, video, and audio in your browser. Nothing is uploaded. Free, private, no limits.</p>
+          <p style={{ fontSize: 15, color: c.muted, fontFamily: font, lineHeight: 1.5 }}>Convert images, video, and audio. Images convert locally. Video and audio are processed on a secure server.</p>
         </div>
 
         {/* How it works */}
         {files.length === 0 && <HowItWorks />}
-
-        <FFmpegBanner status={ffmpegStatus} />
 
         {/* Drop zone */}
         <div onDrop={handleDrop} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onClick={() => fileInputRef.current?.click()}
@@ -505,12 +462,9 @@ export default function FileConverter() {
           </div>
         )}
 
-        {/* Debug panel */}
-        <DebugPanel ffmpegStatus={ffmpegStatus} />
-
         {/* Footer */}
-        <div style={{ marginTop: 32, fontSize: 12, color: "rgb(50,50,50)", fontFamily: font }}>
-          100% client-side. Your files never leave your device.
+        <div style={{ marginTop: 48, fontSize: 12, color: "rgb(50,50,50)", fontFamily: font }}>
+          Images convert in your browser. Video and audio are processed server-side.
         </div>
       </div>
     </div>

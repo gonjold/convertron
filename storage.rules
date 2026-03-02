@@ -1,0 +1,9 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /temp/conversions/{allPaths=**} {
+      allow read, write: if request.resource == null || request.resource.size < 500 * 1024 * 1024;
+    }
+  }
+}
