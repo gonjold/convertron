@@ -115,10 +115,11 @@ async function loadFFmpeg(onProgress) {
     const { fetchFile, toBlobURL } = await import("@ffmpeg/util");
     const ffmpeg = new FFmpeg();
     onProgress(15);
-    const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
+    const baseURL = "https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/esm";
     await ffmpeg.load({
       coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
       wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+      workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, "text/javascript"),
     });
     onProgress(30);
     ffmpegInstance = { ffmpeg, fetchFile };
@@ -146,7 +147,7 @@ async function convertMedia(file, outputFormat, onProgress) {
 
   let args = ["-i", inputName];
   if (outputFormat === "gif") args.push("-vf", "fps=15,scale=480:-1:flags=lanczos", "-loop", "0");
-  else if (outputFormat === "mp4") args.push("-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac");
+  else if (outputFormat === "mp4") args.push("-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac");
   else if (outputFormat === "webm") args.push("-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0", "-c:a", "libopus");
   else if (outputFormat === "mp3") args.push("-vn", "-ab", "192k");
   else if (outputFormat === "wav") args.push("-vn");
@@ -154,6 +155,10 @@ async function convertMedia(file, outputFormat, onProgress) {
   else if (outputFormat === "flac") args.push("-vn", "-c:a", "flac");
   else if (outputFormat === "aac") args.push("-vn", "-c:a", "aac", "-b:a", "192k");
   args.push(outputName);
+
+  // Log FFmpeg output for debugging
+  const logHandler = ({ message }) => { console.log("[ffmpeg]", message); };
+  ffmpeg.on("log", logHandler);
 
   // Hook into real FFmpeg progress events
   const progressHandler = ({ progress: p }) => {
@@ -174,6 +179,7 @@ async function convertMedia(file, outputFormat, onProgress) {
     ]);
   } finally {
     ffmpeg.off("progress", progressHandler);
+    ffmpeg.off("log", logHandler);
   }
 
   onProgress(96);
