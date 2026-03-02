@@ -2,24 +2,34 @@ import { useState, useRef, useCallback, useEffect } from "react";
 
 const SUPPORTED_CONVERSIONS = {
   image: {
-    label: "Image", icon: "🖼",
+    label: "Image",
     inputFormats: ["png", "jpg", "jpeg", "webp", "bmp", "gif", "svg", "ico", "tiff", "avif"],
     outputFormats: ["png", "jpg", "webp", "bmp", "gif", "ico"],
-    color: "#10b981",
   },
   video: {
-    label: "Video", icon: "🎬",
+    label: "Video",
     inputFormats: ["webm", "mp4", "avi", "mov", "mkv", "flv", "wmv", "m4v", "3gp", "ogv"],
     outputFormats: ["mp4", "webm", "avi", "mov", "mkv", "gif"],
-    color: "#6366f1",
   },
   audio: {
-    label: "Audio", icon: "🎵",
+    label: "Audio",
     inputFormats: ["mp3", "wav", "ogg", "flac", "aac", "wma", "m4a", "opus", "webm"],
     outputFormats: ["mp3", "wav", "ogg", "flac", "aac"],
-    color: "#f59e0b",
   },
 };
+
+const c = {
+  bg: "rgb(10,10,10)",
+  surface: "rgb(18,18,18)",
+  border: "rgb(38,38,38)",
+  muted: "rgb(115,115,115)",
+  text: "#ffffff",
+  green: "#22c55e",
+  red: "#ef4444",
+  track: "rgb(28,28,28)",
+};
+
+const font = "'Inter', -apple-system, BlinkMacSystemFont, sans-serif";
 
 function getFileCategory(filename) {
   const ext = filename.split(".").pop().toLowerCase();
@@ -41,8 +51,16 @@ function formatBytes(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
 }
 
+function formatElapsed(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  if (m === 0) return `${s}s`;
+  return `${m}m ${s.toString().padStart(2, "0")}s`;
+}
+
 async function convertImage(file, outputFormat, onProgress) {
   return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Image conversion timed out after 60s.")), 60000);
     onProgress(10);
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -62,14 +80,14 @@ async function convertImage(file, outputFormat, onProgress) {
         onProgress(70);
         const mimeMap = { png: "image/png", jpg: "image/jpeg", webp: "image/webp", bmp: "image/bmp", gif: "image/gif", ico: "image/png" };
         canvas.toBlob(
-          (blob) => { if (!blob) { reject(new Error("Conversion failed")); return; } onProgress(100); resolve(blob); },
+          (blob) => { clearTimeout(timeout); if (!blob) { reject(new Error("Conversion failed")); return; } onProgress(100); resolve(blob); },
           mimeMap[outputFormat] || "image/png", 0.92
         );
       };
-      img.onerror = () => reject(new Error("Failed to load image"));
+      img.onerror = () => { clearTimeout(timeout); reject(new Error("Failed to load image")); };
       img.src = e.target.result;
     };
-    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.onerror = () => { clearTimeout(timeout); reject(new Error("Failed to read file")); };
     reader.readAsDataURL(file);
   });
 }
@@ -110,25 +128,22 @@ async function loadFFmpeg(onProgress) {
   } catch (err) {
     ffmpegLoading = false;
     notifyFFmpegListeners("error");
-    throw new Error("FFmpeg failed to load. Make sure the site is served with Cross-Origin headers enabled.");
+    throw new Error("FFmpeg failed to load. Cross-Origin headers may be missing.");
   }
 }
 
-function withTimeout(promise, ms) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`Conversion timed out after ${Math.round(ms / 1000)}s. Try a smaller file or different format.`)), ms)),
-  ]);
-}
+const MEDIA_TIMEOUT_MS = 10 * 60 * 1000;
 
 async function convertMedia(file, outputFormat, onProgress) {
   const { ffmpeg, fetchFile } = await loadFFmpeg(onProgress);
   const inputExt = getFileExt(file.name);
   const inputName = `input.${inputExt}`;
   const outputName = `output.${outputFormat}`;
-  onProgress(40);
+
+  onProgress(35);
   await ffmpeg.writeFile(inputName, await fetchFile(file));
-  onProgress(50);
+  onProgress(40);
+
   let args = ["-i", inputName];
   if (outputFormat === "gif") args.push("-vf", "fps=15,scale=480:-1:flags=lanczos", "-loop", "0");
   else if (outputFormat === "mp4") args.push("-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac");
@@ -139,75 +154,122 @@ async function convertMedia(file, outputFormat, onProgress) {
   else if (outputFormat === "flac") args.push("-vn", "-c:a", "flac");
   else if (outputFormat === "aac") args.push("-vn", "-c:a", "aac", "-b:a", "192k");
   args.push(outputName);
-  onProgress(60);
-  await withTimeout(ffmpeg.exec(args), 60000);
-  onProgress(90);
+
+  // Hook into real FFmpeg progress events
+  const progressHandler = ({ progress: p }) => {
+    if (typeof p === "number" && p >= 0) {
+      // Map FFmpeg's 0-1 progress into our 40-95 range
+      const mapped = 40 + Math.min(p, 1) * 55;
+      onProgress(Math.round(mapped));
+    }
+  };
+  ffmpeg.on("progress", progressHandler);
+
+  try {
+    await Promise.race([
+      ffmpeg.exec(args),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Conversion timed out after 10 minutes. Try a smaller file.")), MEDIA_TIMEOUT_MS)
+      ),
+    ]);
+  } finally {
+    ffmpeg.off("progress", progressHandler);
+  }
+
+  onProgress(96);
   const data = await ffmpeg.readFile(outputName);
   onProgress(100);
   const mimeMap = { mp4: "video/mp4", webm: "video/webm", avi: "video/x-msvideo", mov: "video/quicktime", mkv: "video/x-matroska", gif: "image/gif", mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", flac: "audio/flac", aac: "audio/aac" };
   return new Blob([data.buffer], { type: mimeMap[outputFormat] || "application/octet-stream" });
 }
 
-function Spinner({ size = 16, color = "#6366f1" }) {
+function Spinner({ size = 14 }) {
   return (
-    <div style={{ width: size, height: size, border: `2px solid ${color}33`, borderTopColor: color, borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
+    <div style={{ width: size, height: size, border: `1.5px solid ${c.track}`, borderTopColor: c.muted, borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
   );
 }
 
 function FFmpegBanner({ status }) {
   if (status === "loading") return (
-    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "12px 20px", background: "rgba(99,102,241,0.08)", border: "1px solid rgba(99,102,241,0.2)", borderRadius: 10, marginBottom: 16 }}>
-      <Spinner size={14} color="#6366f1" />
-      <span style={{ fontSize: 13, color: "#a5b4fc", fontFamily: "'JetBrains Mono', monospace" }}>Loading video engine (~30 MB, first time only)...</span>
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "12px 20px", background: c.surface, border: `1px solid ${c.border}`, borderRadius: 8, marginBottom: 20 }}>
+      <Spinner size={13} />
+      <span style={{ fontSize: 13, color: c.muted, fontFamily: font }}>Loading video engine (~30 MB, first time only)...</span>
     </div>
   );
   if (status === "error") return (
-    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "12px 20px", background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 10, marginBottom: 16 }}>
-      <span style={{ fontSize: 13, color: "#fca5a5", fontFamily: "'JetBrains Mono', monospace" }}>Failed to load video engine. Cross-Origin headers may be missing.</span>
+    <div style={{ padding: "12px 20px", background: c.surface, border: `1px solid ${c.border}`, borderRadius: 8, marginBottom: 20 }}>
+      <span style={{ fontSize: 13, color: c.red, fontFamily: font }}>Failed to load video engine. Cross-Origin headers may be missing.</span>
     </div>
   );
   return null;
 }
 
+function useElapsedTimer(active) {
+  const [elapsed, setElapsed] = useState(0);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (active) {
+      setElapsed(0);
+      ref.current = setInterval(() => setElapsed((e) => e + 1), 1000);
+    } else {
+      clearInterval(ref.current);
+    }
+    return () => clearInterval(ref.current);
+  }, [active]);
+  return elapsed;
+}
+
 function FileItem({ item, onRemove, onFormatChange }) {
   const cat = SUPPORTED_CONVERSIONS[item.category];
-  const barColor = cat?.color || "#888";
+  const isConverting = item.status === "converting";
+  const isMedia = item.category === "video" || item.category === "audio";
+  const elapsed = useElapsedTimer(isConverting);
+
   return (
-    <div style={{ background: item.status === "done" ? "rgba(16,185,129,0.06)" : item.status === "error" ? "rgba(239,68,68,0.06)" : "rgba(255,255,255,0.03)", border: `1px solid ${item.status === "done" ? "rgba(16,185,129,0.2)" : item.status === "error" ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.08)"}`, borderRadius: 10, padding: "14px 18px", display: "flex", alignItems: "center", gap: 14, transition: "all 0.3s ease", flexWrap: "wrap" }}>
-      <div style={{ fontSize: 26, lineHeight: 1 }}>{cat?.icon || "📄"}</div>
+    <div style={{ borderBottom: `1px solid ${c.border}`, padding: "16px 0", display: "flex", alignItems: "center", gap: 16 }}>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
-          <span style={{ fontFamily: "'JetBrains Mono', 'SF Mono', monospace", fontSize: 13, fontWeight: 600, color: "#e2e8f0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "100%" }}>{item.file.name}</span>
-          <span style={{ fontSize: 11, color: "#64748b", fontFamily: "'JetBrains Mono', monospace", flexShrink: 0 }}>{formatBytes(item.file.size)}</span>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 2 }}>
+          <span style={{ fontSize: 14, fontWeight: 500, color: c.text, fontFamily: font, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.file.name}</span>
+          <span style={{ fontSize: 12, color: c.muted, fontFamily: font, flexShrink: 0 }}>{formatBytes(item.file.size)}</span>
         </div>
-        {item.status === "converting" && (
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
-            <div style={{ flex: 1, height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2, overflow: "hidden" }}>
-              <div style={{ height: "100%", width: `${item.progress}%`, background: `linear-gradient(90deg, ${barColor}, ${barColor}cc)`, borderRadius: 2, transition: "width 0.3s ease" }} />
+        {isConverting && (
+          <>
+            <div style={{ height: 2, background: c.track, borderRadius: 1, overflow: "hidden", marginTop: 8 }}>
+              <div style={{ height: "100%", width: `${item.progress}%`, background: c.text, borderRadius: 1, transition: "width 0.4s ease" }} />
             </div>
-            <Spinner size={12} color={barColor} />
-          </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
+              <Spinner size={11} />
+              <span style={{ fontSize: 12, color: c.muted, fontFamily: font }}>
+                {isMedia && item.progress < 40 ? "Loading engine..." : "Converting..."}{isMedia ? " This may take several minutes for large files." : ""}
+              </span>
+              <span style={{ fontSize: 12, color: c.muted, fontFamily: font, marginLeft: "auto" }}>{formatElapsed(elapsed)}</span>
+            </div>
+          </>
         )}
-        {item.status === "error" && <div style={{ fontSize: 11, color: "#ef4444", marginTop: 4, fontFamily: "'JetBrains Mono', monospace" }}>{item.error}</div>}
-        {item.status === "done" && item.outputBlob && <div style={{ fontSize: 11, color: "#10b981", marginTop: 4, fontFamily: "'JetBrains Mono', monospace" }}>✓ Converted · {formatBytes(item.outputBlob.size)}</div>}
+        {item.status === "error" && <div style={{ fontSize: 12, color: c.red, marginTop: 4, fontFamily: font }}>{item.error}</div>}
+        {item.status === "done" && item.outputBlob && (
+          <div style={{ fontSize: 12, color: c.green, marginTop: 4, fontFamily: font }}>Done · {formatBytes(item.outputBlob.size)}</div>
+        )}
       </div>
       {item.status === "idle" && (
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: 12, color: "#64748b" }}>→</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style={{ color: c.muted }}><path d="M5 3l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
           <select value={item.outputFormat} onChange={(e) => onFormatChange(item.id, e.target.value)}
-            style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 6, color: "#e2e8f0", padding: "6px 10px", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", outline: "none", textTransform: "uppercase" }}>
+            style={{ background: c.surface, border: `1px solid ${c.border}`, borderRadius: 6, color: c.text, padding: "6px 10px", fontSize: 13, fontFamily: font, cursor: "pointer", outline: "none", textTransform: "uppercase", appearance: "none", WebkitAppearance: "none", paddingRight: 24, backgroundImage: `url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23737373' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")`, backgroundRepeat: "no-repeat", backgroundPosition: "right 8px center" }}>
             {cat?.outputFormats.filter(f => f !== getFileExt(item.file.name)).map((f) => (<option key={f} value={f}>{f}</option>))}
           </select>
         </div>
       )}
       {item.status === "done" && item.outputBlob && (
         <button onClick={() => { const url = URL.createObjectURL(item.outputBlob); const a = document.createElement("a"); a.href = url; a.download = item.file.name.replace(/\.[^.]+$/, `.${item.outputFormat}`); a.click(); URL.revokeObjectURL(url); }}
-          style={{ background: "linear-gradient(135deg, #10b981, #059669)", border: "none", borderRadius: 8, color: "#fff", padding: "8px 16px", fontSize: 12, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-          ↓ Save
+          style={{ background: c.text, border: "none", borderRadius: 6, color: c.bg, padding: "7px 16px", fontSize: 13, fontWeight: 600, fontFamily: font, cursor: "pointer", flexShrink: 0 }}>
+          Save
         </button>
       )}
-      {item.status !== "converting" && (
-        <button onClick={() => onRemove(item.id)} style={{ background: "none", border: "none", color: "#475569", fontSize: 18, cursor: "pointer", padding: "4px 8px", lineHeight: 1 }}>×</button>
+      {!isConverting && (
+        <button onClick={() => onRemove(item.id)} style={{ background: "none", border: "none", color: c.muted, fontSize: 18, cursor: "pointer", padding: "4px", lineHeight: 1, flexShrink: 0 }} aria-label="Remove">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+        </button>
       )}
     </div>
   );
@@ -242,7 +304,6 @@ export default function FileConverter() {
     setFiles((prev) => [...prev, ...items]);
   }, []);
 
-  // Clipboard paste support
   useEffect(() => {
     const handlePaste = (e) => {
       const items = e.clipboardData?.items;
@@ -291,75 +352,71 @@ export default function FileConverter() {
   const uniqueFormats = [...new Set(allFormats)].sort();
 
   return (
-    <div style={{ minHeight: "100vh", background: "#0a0e17", color: "#e2e8f0", fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, sans-serif", position: "relative", overflow: "hidden" }}>
-      <div style={{ position: "fixed", inset: 0, backgroundImage: "linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px)", backgroundSize: "60px 60px", pointerEvents: "none" }} />
-      <div style={{ position: "relative", zIndex: 1, maxWidth: 720, margin: "0 auto", padding: "40px 20px" }}>
-        <div style={{ textAlign: "center", marginBottom: 48 }}>
-          <div style={{ display: "inline-flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
-            <div style={{ width: 40, height: 40, borderRadius: 10, background: "linear-gradient(135deg, #6366f1, #10b981)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>⚡</div>
-            <h1 style={{ fontSize: "clamp(24px, 5vw, 32px)", fontWeight: 800, letterSpacing: "-0.03em", margin: 0, background: "linear-gradient(135deg, #e2e8f0, #94a3b8)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>CONVERTRON</h1>
-          </div>
-          <p style={{ color: "#64748b", fontSize: "clamp(11px, 2.5vw, 14px)", margin: 0, fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.02em" }}>Free, private, runs in your browser · No uploads, no servers, no limits</p>
-          <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: 6, marginTop: 20 }}>
-            {Object.entries(SUPPORTED_CONVERSIONS).map(([key, cat]) => (
-              <div key={key} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 10px", borderRadius: 20, background: `${cat.color}11`, border: `1px solid ${cat.color}33`, fontSize: 11, color: cat.color, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                <span>{cat.icon}</span><span>{cat.label}</span><span style={{ opacity: 0.5 }}>· {cat.inputFormats.length} formats</span>
-              </div>
-            ))}
-          </div>
+    <div style={{ minHeight: "100vh", background: c.bg, color: c.text, fontFamily: font }}>
+      <div style={{ maxWidth: 640, margin: "0 auto", padding: "64px 24px 48px" }}>
+
+        {/* Header */}
+        <div style={{ marginBottom: 56 }}>
+          <h1 style={{ fontSize: "clamp(28px, 5vw, 36px)", fontWeight: 700, letterSpacing: "-0.03em", color: c.text, marginBottom: 8 }}>Convertron</h1>
+          <p style={{ fontSize: 15, color: c.muted, fontFamily: font, lineHeight: 1.5 }}>Convert images, video, and audio in your browser. Nothing is uploaded. Free, private, no limits.</p>
         </div>
 
         <FFmpegBanner status={ffmpegStatus} />
 
+        {/* Drop zone */}
         <div onDrop={handleDrop} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onClick={() => fileInputRef.current?.click()}
-          style={{ border: `2px dashed ${isDragging ? "#6366f1" : "rgba(255,255,255,0.1)"}`, borderRadius: 16, padding: files.length === 0 ? "60px 20px" : "30px 20px", textAlign: "center", cursor: "pointer", transition: "all 0.3s ease", background: isDragging ? "rgba(99,102,241,0.05)" : "rgba(255,255,255,0.01)", marginBottom: 24 }}>
+          style={{ border: `1.5px dashed ${isDragging ? c.muted : c.border}`, borderRadius: 10, padding: files.length === 0 ? "56px 24px" : "32px 24px", textAlign: "center", cursor: "pointer", transition: "border-color 0.2s ease", marginBottom: 32 }}>
           <input ref={fileInputRef} type="file" multiple accept={uniqueFormats.map((f) => `.${f}`).join(",")} onChange={(e) => { if (e.target.files.length) addFiles(e.target.files); e.target.value = ""; }} style={{ display: "none" }} />
-          <div style={{ fontSize: 36, marginBottom: 12, opacity: 0.6 }}>{isDragging ? "⚡" : "↑"}</div>
-          <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6, color: "#cbd5e1" }}>{isDragging ? "Drop files to convert" : "Drop files here or click to browse"}</div>
-          <div style={{ fontSize: 12, color: "#475569", fontFamily: "'JetBrains Mono', monospace" }}>Images · Videos · Audio — all converted locally in your browser</div>
-          <div style={{ fontSize: 11, color: "#334155", fontFamily: "'JetBrains Mono', monospace", marginTop: 8 }}>You can also paste images with Ctrl+V / Cmd+V</div>
+          <div style={{ fontSize: 14, fontWeight: 500, color: c.text, marginBottom: 6, fontFamily: font }}>{isDragging ? "Drop to add files" : "Drop files here or click to browse"}</div>
+          <div style={{ fontSize: 13, color: c.muted, fontFamily: font }}>Images, video, audio — or paste with Ctrl+V</div>
         </div>
+
+        {/* File list */}
         {files.length > 0 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 24 }}>
+          <div style={{ marginBottom: 32 }}>
             {files.map((item) => (<FileItem key={item.id} item={item} onRemove={removeFile} onFormatChange={changeFormat} />))}
           </div>
         )}
+
+        {/* Action buttons */}
         {files.length > 0 && (
-          <div className="action-buttons" style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+          <div className="action-buttons" style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             {idleFiles.length > 0 && (
-              <button onClick={convertAll} style={{ background: "linear-gradient(135deg, #6366f1, #4f46e5)", border: "none", borderRadius: 10, color: "#fff", padding: "12px 28px", fontSize: 14, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.08em", boxShadow: "0 4px 20px rgba(99,102,241,0.3)" }}>
-                ⚡ Convert {idleFiles.length > 1 ? `All (${idleFiles.length})` : ""}
+              <button onClick={convertAll} style={{ background: c.text, border: "none", borderRadius: 8, color: c.bg, padding: "10px 24px", fontSize: 14, fontWeight: 600, fontFamily: font, cursor: "pointer" }}>
+                Convert{idleFiles.length > 1 ? ` all (${idleFiles.length})` : ""}
               </button>
             )}
             {doneFiles.length > 1 && (
-              <button onClick={downloadAll} style={{ background: "linear-gradient(135deg, #10b981, #059669)", border: "none", borderRadius: 10, color: "#fff", padding: "12px 28px", fontSize: 14, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.08em", boxShadow: "0 4px 20px rgba(16,185,129,0.3)" }}>
-                ↓ Download All
+              <button onClick={downloadAll} style={{ background: c.track, border: `1px solid ${c.border}`, borderRadius: 8, color: c.text, padding: "10px 24px", fontSize: 14, fontWeight: 600, fontFamily: font, cursor: "pointer" }}>
+                Download all
               </button>
             )}
-            <button onClick={clearAll} style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10, color: "#94a3b8", padding: "12px 20px", fontSize: 13, fontWeight: 600, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.05em" }}>Clear</button>
+            <button onClick={clearAll} style={{ background: "transparent", border: `1px solid ${c.border}`, borderRadius: 8, color: c.muted, padding: "10px 20px", fontSize: 13, fontWeight: 500, fontFamily: font, cursor: "pointer" }}>Clear</button>
           </div>
         )}
+
+        {/* Supported formats */}
         {files.length === 0 && (
-          <div style={{ marginTop: 40 }}>
-            <div style={{ textAlign: "center", fontSize: 12, color: "#475569", fontFamily: "'JetBrains Mono', monospace", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 20 }}>Supported Conversions</div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12 }}>
+          <div style={{ marginTop: 48 }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: c.muted, fontFamily: font, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 20 }}>Supported formats</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
               {Object.entries(SUPPORTED_CONVERSIONS).map(([key, cat]) => (
-                <div key={key} style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 16 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                    <span style={{ fontSize: 18 }}>{cat.icon}</span>
-                    <span style={{ fontSize: 13, fontWeight: 700, color: cat.color, textTransform: "uppercase", letterSpacing: "0.05em", fontFamily: "'JetBrains Mono', monospace" }}>{cat.label}</span>
-                  </div>
-                  <div style={{ fontSize: 11, color: "#64748b", fontFamily: "'JetBrains Mono', monospace", lineHeight: 1.8 }}>
-                    <div><span style={{ color: "#94a3b8" }}>IN:</span> {cat.inputFormats.join(", ")}</div>
-                    <div><span style={{ color: "#94a3b8" }}>OUT:</span> {cat.outputFormats.join(", ")}</div>
+                <div key={key} style={{ borderBottom: `1px solid ${c.border}`, padding: "16px 0" }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: c.text, fontFamily: font, marginBottom: 6 }}>{cat.label}</div>
+                  <div style={{ fontSize: 12, color: c.muted, fontFamily: font, lineHeight: 1.7 }}>
+                    <span>{cat.inputFormats.join(", ")}</span>
+                    <span style={{ margin: "0 8px", color: c.border }}>→</span>
+                    <span>{cat.outputFormats.join(", ")}</span>
                   </div>
                 </div>
               ))}
             </div>
           </div>
         )}
-        <div style={{ textAlign: "center", marginTop: 48, fontSize: 11, color: "#334155", fontFamily: "'JetBrains Mono', monospace" }}>
-          100% client-side · Your files never leave your device · Powered by FFmpeg.wasm + Canvas API
+
+        {/* Footer */}
+        <div style={{ marginTop: 56, fontSize: 12, color: "rgb(50,50,50)", fontFamily: font }}>
+          100% client-side. Your files never leave your device.
         </div>
       </div>
     </div>
