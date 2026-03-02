@@ -8,6 +8,24 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const { execSync } = require("child_process");
+
+// Verify ffmpeg binary at startup
+console.log("[convertron] ffmpeg-static path:", ffmpegPath);
+try {
+  const exists = fs.existsSync(ffmpegPath);
+  console.log("[convertron] ffmpeg binary exists:", exists);
+  if (exists) {
+    const stats = fs.statSync(ffmpegPath);
+    console.log("[convertron] ffmpeg binary size:", stats.size, "mode:", stats.mode.toString(8));
+    // Ensure executable
+    fs.chmodSync(ffmpegPath, 0o755);
+    const version = execSync(`${ffmpegPath} -version 2>&1 | head -1`, { timeout: 5000 }).toString().trim();
+    console.log("[convertron] ffmpeg version:", version);
+  }
+} catch (err) {
+  console.error("[convertron] ffmpeg binary check failed:", err.message);
+}
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -18,12 +36,15 @@ const db = getFirestore();
 exports.convertMedia = onCall(
   {
     region: "us-east1",
-    timeoutSeconds: 300,
-    memory: "2GiB",
+    timeoutSeconds: 540,
+    memory: "4GiB",
+    cpu: 2,
     maxInstances: 10,
+    concurrency: 1,
   },
   async (request) => {
     const { storagePath, outputFormat, docId } = request.data;
+    console.log("[convertron] Request received:", { storagePath, outputFormat, docId });
 
     // Validate inputs
     if (!storagePath || !outputFormat || !docId) {
@@ -48,9 +69,11 @@ exports.convertMedia = onCall(
 
     try {
       // Update status to processing
+      console.log("[convertron] Updating status to processing...");
       await docRef.update({ status: "processing", startedAt: Date.now() });
 
       // Download input from Storage
+      console.log("[convertron] Downloading from Storage:", normalizedPath);
       const bucket = storage.bucket();
       const inputFile = bucket.file(normalizedPath);
       const [exists] = await inputFile.exists();
@@ -58,8 +81,13 @@ exports.convertMedia = onCall(
         throw new HttpsError("not-found", "Input file not found in storage");
       }
       await inputFile.download({ destination: inputPath });
+      const inputStats = fs.statSync(inputPath);
+      console.log("[convertron] Downloaded:", inputStats.size, "bytes to", inputPath);
 
       // Run FFmpeg conversion
+      console.log("[convertron] Starting FFmpeg:", outputFormat);
+      const startTime = Date.now();
+
       await new Promise((resolve, reject) => {
         let cmd = ffmpeg(inputPath);
 
@@ -68,15 +96,15 @@ exports.convertMedia = onCall(
           cmd = cmd
             .videoCodec("libx264")
             .audioCodec("aac")
-            .outputOptions(["-movflags", "+faststart", "-preset", "fast", "-crf", "23"]);
+            .outputOptions(["-vsync", "cfr", "-preset", "ultrafast", "-crf", "23", "-movflags", "+faststart"]);
         } else if (outputFormat === "webm") {
           cmd = cmd
             .videoCodec("libvpx-vp9")
             .audioCodec("libopus")
-            .outputOptions(["-crf", "30", "-b:v", "0"]);
+            .outputOptions(["-vsync", "cfr", "-crf", "30", "-b:v", "0", "-cpu-used", "4", "-deadline", "realtime"]);
         } else if (outputFormat === "gif") {
           cmd = cmd
-            .outputOptions(["-vf", "fps=15,scale=480:-1:flags=lanczos", "-loop", "0"])
+            .outputOptions(["-vsync", "cfr", "-vf", "fps=15,scale=480:-1:flags=lanczos", "-loop", "0"])
             .noAudio();
         } else if (outputFormat === "mp3") {
           cmd = cmd.noVideo().audioCodec("libmp3lame").audioBitrate("192k");
@@ -89,39 +117,57 @@ exports.convertMedia = onCall(
         } else if (outputFormat === "aac") {
           cmd = cmd.noVideo().audioCodec("aac").audioBitrate("192k");
         } else if (outputFormat === "avi") {
-          cmd = cmd.videoCodec("libx264").audioCodec("aac");
+          cmd = cmd.videoCodec("libx264").audioCodec("aac").outputOptions(["-vsync", "cfr", "-preset", "ultrafast"]);
         } else if (outputFormat === "mov") {
-          cmd = cmd.videoCodec("libx264").audioCodec("aac").outputOptions(["-movflags", "+faststart"]);
+          cmd = cmd.videoCodec("libx264").audioCodec("aac").outputOptions(["-vsync", "cfr", "-preset", "ultrafast", "-movflags", "+faststart"]);
         } else if (outputFormat === "mkv") {
-          cmd = cmd.videoCodec("libx264").audioCodec("aac");
+          cmd = cmd.videoCodec("libx264").audioCodec("aac").outputOptions(["-vsync", "cfr", "-preset", "ultrafast"]);
         }
 
         cmd
+          .on("start", (cmdLine) => console.log("[convertron] FFmpeg command:", cmdLine))
+          .on("stderr", (line) => {
+            // Log FFmpeg stderr output periodically (progress info)
+            if (line.includes("time=") || line.includes("error") || line.includes("Error")) {
+              console.log("[convertron] FFmpeg:", line.trim());
+            }
+          })
+          .on("end", () => {
+            console.log("[convertron] FFmpeg finished in", ((Date.now() - startTime) / 1000).toFixed(1), "s");
+            resolve();
+          })
+          .on("error", (err) => {
+            console.error("[convertron] FFmpeg error:", err.message);
+            reject(new Error(`FFmpeg error: ${err.message}`));
+          })
           .output(outputPath)
-          .on("end", resolve)
-          .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
           .run();
       });
 
       // Upload result to Storage
+      const outputStats = fs.statSync(outputPath);
+      console.log("[convertron] Output file:", outputStats.size, "bytes");
+
       const outputStoragePath = `temp/conversions/${docId}/output.${outputFormat}`;
+      const downloadToken = crypto.randomUUID();
+      console.log("[convertron] Uploading to Storage:", outputStoragePath);
       await bucket.upload(outputPath, {
         destination: outputStoragePath,
         metadata: {
           contentType: getMimeType(outputFormat),
+          metadata: {
+            firebaseStorageDownloadTokens: downloadToken,
+          },
         },
       });
 
-      // Generate signed download URL (7-day expiry)
-      const [downloadUrl] = await bucket.file(outputStoragePath).getSignedUrl({
-        action: "read",
-        expires: Date.now() + 7 * 24 * 60 * 60 * 1000,
-      });
-
-      // Get output file size
-      const outputStats = fs.statSync(outputPath);
+      // Build Firebase download URL (no IAM signBlob permission needed)
+      const bucketName = bucket.name;
+      const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodeURIComponent(outputStoragePath)}?alt=media&token=${downloadToken}`;
+      console.log("[convertron] Download URL generated");
 
       // Update Firestore with result
+      console.log("[convertron] Updating Firestore: complete");
       await docRef.update({
         status: "complete",
         downloadUrl,
@@ -132,14 +178,17 @@ exports.convertMedia = onCall(
       // Clean up input file from Storage
       await inputFile.delete().catch(() => {});
 
+      console.log("[convertron] Done! URL length:", downloadUrl.length);
       return { success: true, downloadUrl };
     } catch (err) {
+      console.error("[convertron] CAUGHT ERROR:", err.message, err.stack);
+
       // Update Firestore with error
       await docRef.update({
         status: "error",
         error: err.message || "Conversion failed",
         completedAt: Date.now(),
-      }).catch(() => {});
+      }).catch((e) => console.error("[convertron] Failed to update error status:", e.message));
 
       if (err instanceof HttpsError) throw err;
       throw new HttpsError("internal", err.message || "Conversion failed");

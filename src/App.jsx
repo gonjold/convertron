@@ -135,7 +135,7 @@ async function convertMediaServer(file, outputFormat, onProgress, onStatus) {
 
   // Phase 2: Call Cloud Function
   onStatus("processing");
-  const convertMedia = httpsCallable(functions, "convertMedia", { timeout: 300000 });
+  const convertMedia = httpsCallable(functions, "convertMedia", { timeout: 540000 });
 
   // Start Firestore listener for status updates
   const statusPromise = new Promise((resolve, reject) => {
@@ -157,8 +157,8 @@ async function convertMediaServer(file, outputFormat, onProgress, onStatus) {
     // Timeout safety
     setTimeout(() => {
       unsubscribe();
-      reject(new Error("Conversion timed out after 5 minutes"));
-    }, 5 * 60 * 1000);
+      reject(new Error("Conversion timed out after 9 minutes"));
+    }, 9 * 60 * 1000);
   });
 
   // Fire the function call (don't await — we listen via Firestore)
@@ -261,10 +261,19 @@ function FileItem({ item, onRemove, onFormatChange }) {
           <div style={{ fontSize: 12, color: c.green, fontFamily: font, marginBottom: 10 }}>
             Done{item.outputSize ? ` · ${formatBytes(item.outputSize)}` : ""}
           </div>
-          <a href={item.downloadUrl} download={item.file.name.replace(/\.[^.]+$/, `.${item.outputFormat}`)}
-            style={{ display: "block", width: "100%", background: c.text, border: "none", borderRadius: 8, color: c.bg, padding: "12px 24px", fontSize: 14, fontWeight: 600, fontFamily: font, cursor: "pointer", textAlign: "center", textDecoration: "none", boxSizing: "border-box" }}>
+          <button onClick={async () => {
+              const response = await fetch(item.downloadUrl);
+              const blob = await response.blob();
+              const blobUrl = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              a.href = blobUrl;
+              a.download = item.file.name.replace(/\.[^.]+$/, `.${item.outputFormat}`);
+              a.click();
+              URL.revokeObjectURL(blobUrl);
+            }}
+            style={{ width: "100%", background: c.text, border: "none", borderRadius: 8, color: c.bg, padding: "12px 24px", fontSize: 14, fontWeight: 600, fontFamily: font, cursor: "pointer", textAlign: "center" }}>
             Download {item.file.name.replace(/\.[^.]+$/, `.${item.outputFormat}`)}
-          </a>
+          </button>
         </div>
       )}
 

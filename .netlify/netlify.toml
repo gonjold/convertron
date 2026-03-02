@@ -1,4 +1,3 @@
-headersOrigin = "config"
 plugins = []
 redirects = []
 
@@ -8,8 +7,8 @@ redirects = []
 
 [build]
 publish = "/Users/jgsystems/convertron/dist"
-publishOrigin = "ui"
-commandOrigin = "ui"
+publishOrigin = "config"
+commandOrigin = "config"
 command = "npm run build"
 
 [build.environment]
@@ -30,5 +29,4 @@ command = "npm run build"
 for = "/*"
 
 [headers.values]
-Cross-Origin-Embedder-Policy = "credentialless"
-Cross-Origin-Opener-Policy = "same-origin"
+X-Frame-Options = "DENY"
